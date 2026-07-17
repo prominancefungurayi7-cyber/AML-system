@@ -2659,6 +2659,11 @@ def process_transaction_event(
         risk_score = rule_score
         risk_level = rule_level
         reason = rule_reason
+    
+    # Set AI-related fields for database compatibility
+    ai_level = behavioral_level if behavioral_score > 0 else None
+    ai_confidence = min(1.0, behavioral_score / 100) if behavioral_score > 0 else 0
+    ai_reason = behavioral_reason if behavioral_score > 0 else None
 
 
 
