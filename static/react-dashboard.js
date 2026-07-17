@@ -371,8 +371,9 @@
             h("label", null, "Number of Transactions"),
             h("select", { name: "count", defaultValue: "100" },
               h("option", { value: "100" }, "100"),
+              h("option", { value: "500" }, "500"),
               h("option", { value: "1000" }, "1,000"),
-              h("option", { value: "5000" }, "5,000")
+              h("option", { value: "2000" }, "2,000")
             ),
             h("button", { type: "submit" }, "Generate Transactions")
           )
