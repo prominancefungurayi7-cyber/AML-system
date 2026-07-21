@@ -60,6 +60,10 @@ import threading
 
 import time
 
+import uuid
+
+from queue import Empty, Queue
+
 from datetime import datetime, timedelta, timezone
 
 from decimal import Decimal
@@ -67,8 +71,6 @@ from decimal import Decimal
 from email.message import EmailMessage
 
 from functools import wraps
-
-from queue import Queue
 
 from urllib.parse import unquote, urlparse
 
@@ -108,29 +110,182 @@ from typing import Optional, Dict, List, Tuple, Any
 
 
 
-from ai_detector import (
-
+# Import from consolidated ai_core module
+from ai_core import (
+    MODEL_PATH,
     PROFILE_FEATURE_DEFAULTS,
-
+    BehavioralProfiler,
+    CustomerBehavioralProfile,
+    TransactionAnomaly,
+    behavioral_profiler,
     delete_ai_model,
-
     get_model_metadata,
-
     predict_risk_level,
-
     train_ai_model,
-
 )
-
-from aml_logic import RuleResult, analyze_transaction, get_triggered_rules
-
-from behavioral_profiler import BehavioralProfiler, CustomerBehavioralProfile, TransactionAnomaly
 
 from config import DevelopmentConfig, ProductionConfig, TestingConfig
 
-from realtime import RealtimeBroker
-
 from screening import is_registration_blocked, screen_entity, screening_summary
+
+
+# ============================================================================
+# Real-time Event Broadcasting (Consolidated from realtime.py)
+# ============================================================================
+
+try:
+    import redis
+except ImportError:
+    redis = None
+
+try:
+    from kafka import KafkaProducer
+except ImportError:
+    KafkaProducer = None
+
+
+class RealtimeBroker:
+    """Real-time event broker for WebSocket/Redis/Kafka broadcasting."""
+    def __init__(self, app=None, socketio=None):
+        self.app = app
+        self.socketio = socketio
+        self._subscribers = []
+        self._redis_client = None
+        self._redis_pubsub = None
+        self._kafka_producer = None
+        self._instance_id = str(uuid.uuid4())
+        self._init_brokers()
+        self._start_redis_listener()
+
+    def _init_brokers(self):
+        redis_url = os.environ.get("REDIS_URL")
+        if redis_url and redis is not None:
+            try:
+                self._redis_client = redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=0.5,
+                    socket_timeout=0.5,
+                )
+                self._redis_client.ping()
+            except Exception:
+                self._redis_client = None
+
+        kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS")
+        if kafka_bootstrap and KafkaProducer is not None:
+            try:
+                self._kafka_producer = KafkaProducer(
+                    bootstrap_servers=[server.strip() for server in kafka_bootstrap.split(",") if server.strip()],
+                    api_version_auto_timeout_ms=500,
+                    request_timeout_ms=1000,
+                    max_block_ms=1000,
+                    value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+                )
+            except Exception:
+                self._kafka_producer = None
+
+    def _start_redis_listener(self):
+        """Subscribe to Redis pub/sub for cross-instance event fan-out."""
+        if self._redis_client is None:
+            return
+        try:
+            self._redis_pubsub = self._redis_client.pubsub(ignore_subscribe_messages=True)
+            self._redis_pubsub.subscribe("aml-events")
+
+            def _listen():
+                for raw in self._redis_pubsub.listen():
+                    if raw.get("type") != "message":
+                        continue
+                    try:
+                        message = json.loads(raw["data"])
+                        if message.get("publisher") == self._instance_id:
+                            continue
+                        self._local_deliver(message.get("event"), message.get("data"))
+                    except Exception:
+                        pass
+
+            thread = threading.Thread(target=_listen, daemon=True)
+            thread.start()
+        except Exception:
+            self._redis_pubsub = None
+
+    def _local_deliver(self, event_name, payload):
+        if not event_name:
+            return
+        message = {"event": event_name, "data": payload}
+        delivered = set()
+        app_subscribers = self.app.config.get("STREAM_SUBSCRIBERS", []) if self.app is not None else []
+        for subscriber in list(self._subscribers) + list(app_subscribers):
+            subscriber_id = id(subscriber)
+            if subscriber_id in delivered:
+                continue
+            delivered.add(subscriber_id)
+            try:
+                subscriber.put_nowait(message)
+            except Exception:
+                pass
+        if self.socketio is not None:
+            try:
+                self.socketio.emit(event_name, payload, broadcast=True)
+            except Exception:
+                pass
+
+    def set_socketio(self, socketio):
+        self.socketio = socketio
+
+    def add_subscriber(self, queue):
+        self._subscribers.append(queue)
+        if self.app is not None:
+            app_subscribers = self.app.config.setdefault("STREAM_SUBSCRIBERS", [])
+            if queue not in app_subscribers:
+                app_subscribers.append(queue)
+        return queue
+
+    def publish(self, event_name, payload):
+        message = {"event": event_name, "data": payload, "publisher": self._instance_id}
+        self._local_deliver(event_name, payload)
+
+        if self._redis_client is not None:
+            try:
+                event_key = f"aml_events:history"
+                self._redis_client.lpush(event_key, json.dumps(message))
+                self._redis_client.ltrim(event_key, 0, 999)
+                self._redis_client.expire(event_key, 3600)
+                self._redis_client.publish("aml-events", json.dumps(message))
+            except Exception:
+                pass
+
+        if self._kafka_producer is not None:
+            try:
+                self._kafka_producer.send("aml-events", message)
+            except Exception:
+                pass
+
+    def stream_response(self):
+        queue = Queue()
+        self.add_subscriber(queue)
+
+        def generate():
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        message = queue.get(timeout=1)
+                    except Empty:
+                        yield ": heartbeat\n\n"
+                        continue
+                    yield f"event: {message['event']}\n"
+                    yield f"data: {json.dumps(message['data'])}\n\n"
+            finally:
+                if queue in self._subscribers:
+                    self._subscribers.remove(queue)
+                if self.app is not None:
+                    app_subscribers = self.app.config.get("STREAM_SUBSCRIBERS", [])
+                    if queue in app_subscribers:
+                        app_subscribers.remove(queue)
+
+        return Response(generate(), mimetype="text/event-stream")
+
 
 
 
@@ -146,8 +301,8 @@ app.config.from_object(
 
 )
 
-# Initialize behavioral profiler
-behavioral_profiler = BehavioralProfiler(min_transactions_for_profile=10)
+# behavioral_profiler is imported from ai_core module
+# No need to reinitialize - using global instance from ai_core
 
 
 def get_customer_behavioral_profile(conn, account_number: str) -> Optional[CustomerBehavioralProfile]:
@@ -2326,25 +2481,9 @@ def _risk_level_from_score(score):
 
 
 
-def _is_mandatory_compliance_hit(triggered_rules, rule_reason):
-
-    return (
-
-        "[CTR REQUIRED]" in (rule_reason or "")
-
-        or any(getattr(r, "rule_id", "") == "R09" for r in triggered_rules)
-
-        or any(getattr(r, "rule_id", "") == "R14" for r in triggered_rules)
-
-    )
-
-
-
-
-
 def _combine_rule_ai_risk(rule_score, rule_level, rule_reason, triggered_rules, ai_level, ai_confidence):
-
-    mandatory = _is_mandatory_compliance_hit(triggered_rules, rule_reason)
+    # Simplified - mandatory check now based on screening severity only
+    mandatory = any(r.get("severity") == "critical" for r in triggered_rules) if triggered_rules else False
 
     rule_rank = RISK_RANK.get(rule_level, 0)
 
@@ -2546,65 +2685,25 @@ def process_transaction_event(
 
     screen_delta, screen_reason, screen_json = screening_summary(screening_hits)
 
-
-
-    rule_score, rule_level, rule_reason = analyze_transaction(
-
-        conn, transaction_type, amount, sender_account, receiver_account, timestamp,
-
-        destination_country=destination_country,
-
-    )
-
+    # Legacy rule-based assessment removed - using AI + Behavioral only
+    # Screening hits are incorporated directly into risk assessment
+    rule_score = screen_delta if screen_delta else 0
+    rule_level = _risk_level_from_score(rule_score)
+    rule_reason = screen_reason if screen_delta else "No screening hits"
+    
+    # Build triggered rules list from screening only
+    triggered = []
     if screen_delta:
+        triggered.append({
+            "rule_id": "SCREENING",
+            "triggered": True,
+            "score_delta": screen_delta,
+            "reason": screen_reason,
+            "severity": "critical" if any(h.list_type == "sanctions" for h in screening_hits) else "warning",
+            "typology": "Watchlist / PEP Screening",
+        })
 
-        rule_score = min(100, rule_score + screen_delta)
-
-        rule_level = _risk_level_from_score(rule_score)
-
-        rule_reason = f"{screen_reason}. {rule_reason}"
-
-        if any(h.list_type == "sanctions" for h in screening_hits):
-
-            rule_reason = "[SAR REVIEW] " + rule_reason
-
-
-
-    triggered = get_triggered_rules(
-
-        conn, transaction_type, amount, sender_account, receiver_account, timestamp,
-
-        destination_country=destination_country,
-
-    )
-
-    if screen_delta:
-
-        triggered.append(RuleResult(
-
-            rule_id="R14",
-
-            triggered=True,
-
-            score_delta=screen_delta,
-
-            reason=screen_reason,
-
-            severity="critical" if any(h.list_type == "sanctions" for h in screening_hits) else "warning",
-
-            typology="Watchlist / PEP Screening",
-
-        ))
-
-
-
-    rules_json = json.dumps([
-
-        {"id": r.rule_id, "typology": getattr(r, "typology", ""), "score_delta": r.score_delta, "reason": r.reason}
-
-        for r in triggered
-
-    ] + screen_json)
+    rules_json = json.dumps(triggered + screen_json)
 
 
 
@@ -2628,15 +2727,9 @@ def process_transaction_event(
         conn, transaction_dict, sender_account
     )
     
-    # Secondary: Rule-based assessment (for mandatory compliance and fallback)
-    rule_score, rule_level, rule_reason = analyze_transaction(
-        conn, transaction_type, amount, sender_account, receiver_account, timestamp,
-        destination_country=destination_country,
-    )
-    
-    # Combine behavioral and rule-based assessments
-    # Behavioral assessment takes priority unless mandatory compliance rules are triggered
-    mandatory = _is_mandatory_compliance_hit(triggered, rule_reason)
+    # Combine behavioral and screening assessments
+    # Behavioral assessment takes priority unless mandatory screening rules are triggered
+    mandatory = any(h.list_type == "sanctions" for h in screening_hits)
     
     if mandatory:
         # Mandatory compliance rules override behavioral assessment
@@ -4720,7 +4813,7 @@ def ensure_ai_model_ready():
 
         return
 
-    if os.path.exists(ai_detector.MODEL_PATH):
+    if os.path.exists(MODEL_PATH):
 
         return
 
