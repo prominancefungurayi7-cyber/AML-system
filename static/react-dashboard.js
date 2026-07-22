@@ -99,12 +99,55 @@
   function useRealtime(handlers) {
     useEffect(() => {
       if (window.io) {
-        const socket = window.io({ transports: ["websocket", "polling"] });
+        const socket = window.io({ 
+          transports: ["websocket", "polling"],
+          reconnection: true,
+          reconnectionAttempts: 5,
+          reconnectionDelay: 1000,
+          reconnectionDelayMax: 5000
+        });
+        
         Object.keys(handlers).forEach((eventName) => socket.on(eventName, handlers[eventName]));
-        return () => socket.disconnect();
+        
+        socket.on('connect', () => {
+          console.log('SocketIO connected', { socketId: socket.id });
+        });
+        
+        socket.on('disconnect', (reason) => {
+          console.log('SocketIO disconnected', { reason });
+        });
+        
+        socket.on('connect_error', (error) => {
+          console.error('SocketIO connection error:', error);
+        });
+        
+        socket.on('reconnect', (attemptNumber) => {
+          console.log('SocketIO reconnected', { attemptNumber });
+        });
+        
+        socket.on('reconnect_attempt', (attemptNumber) => {
+          console.log('SocketIO reconnection attempt', { attemptNumber });
+        });
+        
+        socket.on('reconnect_error', (error) => {
+          console.error('SocketIO reconnection error:', error);
+        });
+        
+        // Send heartbeat every 30 seconds to maintain connection
+        const heartbeatInterval = setInterval(() => {
+          if (socket.connected) {
+            socket.emit('heartbeat');
+          }
+        }, 30000);
+        
+        return () => {
+          clearInterval(heartbeatInterval);
+          socket.disconnect();
+        };
       }
 
       if (window.EventSource) {
+        console.log('Using EventSource fallback for realtime');
         const source = new EventSource("/stream");
         Object.keys(handlers).forEach((eventName) => {
           source.addEventListener(eventName, (event) => {
@@ -112,9 +155,15 @@
             handlers[eventName](payload);
           });
         });
+        
+        source.addEventListener('error', (error) => {
+          console.error('EventSource error:', error);
+        });
+        
         return () => source.close();
       }
 
+      console.warn('Neither SocketIO nor EventSource available for realtime');
       return undefined;
     }, []);
   }
@@ -132,6 +181,16 @@
     const [stats, setStats] = useState(initialData.stats || {});
     const [feed, setFeed] = useState([]);
     const [status, setStatus] = useState("Connected | live monitoring active");
+    const [activeSection, setActiveSection] = useState("overview");
+    const [sidebarOpen, setSidebarOpen] = useState(false);
+
+    const sidebarItems = [
+      { id: "overview", label: "Overview" },
+      { id: "transactions", label: "Transactions" },
+      { id: "alerts", label: "Alerts" },
+      { id: "activity", label: "Activity Feed" },
+      { id: "signout", label: "Sign Out", href: "/logout" }
+    ];
 
     const addFeed = (text) => setFeed((current) => trim([{ text, timestamp: new Date().toLocaleTimeString() }, ...current], 25));
     const adjustBalanceFromTransaction = (txn) => {
@@ -204,43 +263,89 @@
       { label: "Open alerts", value: stats.open_alerts || alerts.filter((alert) => alert.status === "open").length, caption: "live cases" },
     ];
 
-    return h(window.React.Fragment, null,
-      h(StatGrid, { items: metricItems }),
-      h("section", { className: "grid" },
-        h("div", { className: "card account-card" },
-          h("p", { className: "status-pill" }, "Primary Account"),
-          h("h3", null, accountNumber),
-          h("p", { className: "metric" }, money(balance)),
-          h("p", { className: "muted-line" }, "Available balance updates automatically after every live transaction.")
-        ),
-        h("div", { className: "card action-card" },
-          h(PanelHeading, { title: "Initiate Transaction" }),
-          h("form", { method: "post", action: "/customer/transaction" },
-            h("label", null, "Type"),
-            h("select", { name: "type", defaultValue: "deposit" },
-              h("option", { value: "deposit" }, "Deposit"),
-              h("option", { value: "withdraw" }, "Withdrawal"),
-            h("option", { value: "transfer" }, "Transfer")
-            ),
-            h("label", null, "Amount"),
-            h("input", { type: "number", step: "0.01", name: "amount", required: true }),
-            h("label", null, "Recipient Account Number"),
-            h("input", { name: "recipient", placeholder: "ACC1004" }),
-            h("p", { className: "form-hint" }, "Recipient is required for transfers only."),
-            h("button", { type: "submit" }, "Process Transaction")
-          )
+    const renderSection = () => {
+      switch (activeSection) {
+        case "overview":
+          return h(window.React.Fragment, null,
+            h(StatGrid, { items: metricItems }),
+            h("section", { className: "grid" },
+              h("div", { className: "card account-card" },
+                h("p", { className: "status-pill" }, "Primary Account"),
+                h("h3", null, accountNumber),
+                h("p", { className: "metric" }, money(balance)),
+                h("p", { className: "muted-line" }, "Available balance updates automatically after every live transaction.")
+              ),
+              h("div", { className: "card action-card" },
+                h(PanelHeading, { title: "Initiate Transaction" }),
+                h("form", { method: "post", action: "/customer/transaction" },
+                  h("label", null, "Type"),
+                  h("select", { name: "type", defaultValue: "deposit" },
+                    h("option", { value: "deposit" }, "Deposit"),
+                    h("option", { value: "withdraw" }, "Withdrawal"),
+                    h("option", { value: "transfer" }, "Transfer")
+                  ),
+                  h("label", null, "Amount"),
+                  h("input", { type: "number", step: "0.01", name: "amount", required: true }),
+                  h("label", null, "Recipient Account Number"),
+                  h("input", { name: "recipient", placeholder: "ACC1004" }),
+                  h("p", { className: "form-hint" }, "Recipient is required for transfers only."),
+                  h("button", { type: "submit" }, "Process Transaction")
+                )
+              )
+            )
+          );
+        case "transactions":
+          return h(CustomerTransactionsPanel, { transactions });
+        case "alerts":
+          return h(CustomerAlertsPanel, { alerts });
+        case "activity":
+          return h("section", { className: "card table-card live-feed-card" },
+            h(PanelHeading, { title: "Live AML Feed", meta: h(LiveStatus, null, status) }),
+            feed.length ? h("ul", null, feed.map((event, index) => (
+              h("li", { key: `${event.timestamp}-${index}` }, `${event.timestamp} - ${event.text}`)
+            ))) : h(EmptyState, null, "Waiting for live events.")
+          );
+        default:
+          return null;
+      }
+    };
+
+    return h("div", { className: "admin-layout" },
+      h("button", {
+        className: "sidebar-toggle",
+        onClick: () => setSidebarOpen(true),
+        type: "button",
+        "aria-label": "Open sidebar"
+      }, h("svg", { viewBox: "0 0 24 24" },
+        h("line", { x1: "3", y1: "12", x2: "21", y2: "12" }),
+        h("line", { x1: "3", y1: "6", x2: "21", y2: "6" }),
+        h("line", { x1: "3", y1: "18", x2: "21", y2: "18" })
+      )),
+      sidebarOpen && h("div", {
+        className: "sidebar-overlay active",
+        onClick: () => setSidebarOpen(false)
+      }),
+      h("aside", { className: `admin-sidebar ${sidebarOpen ? "open" : ""}` },
+        h("h3", null, "Customer Portal"),
+        h("nav", null,
+          sidebarItems.map((item) => item.href ? 
+            h("a", {
+              key: item.id,
+              href: item.href,
+              className: "sidebar-item"
+            }, item.label) :
+            h("button", {
+              key: item.id,
+              className: activeSection === item.id ? "sidebar-item active" : "sidebar-item",
+              onClick: () => {
+                setActiveSection(item.id);
+                setSidebarOpen(false);
+              },
+              type: "button"
+            }, item.label))
         )
       ),
-      h("section", { className: "react-dashboard-grid" },
-        h(CustomerTransactionsPanel, { transactions }),
-        h(CustomerAlertsPanel, { alerts })
-      ),
-      h("section", { className: "card table-card live-feed-card" },
-        h(PanelHeading, { title: "Live AML Feed", meta: h(LiveStatus, null, status) }),
-        feed.length ? h("ul", null, feed.map((event, index) => (
-          h("li", { key: `${event.timestamp}-${index}` }, `${event.timestamp} - ${event.text}`)
-        ))) : h(EmptyState, null, "Waiting for live events.")
-      )
+      h("main", { className: "admin-content" }, renderSection())
     );
   }
 
@@ -301,6 +406,18 @@
     const [transactions, setTransactions] = useState(initialData.transactions || []);
     const [watchlist, setWatchlist] = useState(initialData.watchlist || []);
     const [stats, setStats] = useState(initialData.system_stats || {});
+    const [activeSection, setActiveSection] = useState("overview");
+    const [sidebarOpen, setSidebarOpen] = useState(false);
+
+    const sidebarItems = [
+      { id: "overview", label: "Overview" },
+      { id: "users", label: "User Management" },
+      { id: "transactions", label: "Transactions" },
+      { id: "watchlist", label: "Watchlist" },
+      { id: "activity", label: "Activity Feed" },
+      { id: "reports", label: "Reports", href: "/reports" },
+      { id: "signout", label: "Sign Out", href: "/logout" }
+    ];
 
     const updateBalances = (txn) => {
       const amount = Number(txn.amount || 0);
@@ -361,101 +478,152 @@
       { label: "Pending CTRs", value: stats.pending_ctrs || 0, caption: "currency reports" },
     ];
 
-    return h(window.React.Fragment, null,
-      h(StatGrid, { items: metricItems }),
-      h("section", { className: "react-dashboard-grid" },
-        h("div", { className: "card action-card" },
-          h(PanelHeading, { title: "Transaction Simulator", meta: h("span", { className: "status-pill" }, "Customers only") }),
-          h("p", { className: "muted-line" }, "Generate realistic deposits, withdrawals, and transfers using registered customer accounts."),
-          h("form", { method: "post", action: "/admin/generate-transactions" },
-            h("label", null, "Number of Transactions"),
-            h("select", { name: "count", defaultValue: "100" },
-              h("option", { value: "100" }, "100"),
-              h("option", { value: "500" }, "500"),
-              h("option", { value: "1000" }, "1000"),
-              h("option", { value: "2000" }, "2000")
-            ),
-            h("button", { type: "submit" }, "Generate Transactions")
-          )
-        ),
-        h("div", { className: "card action-card" },
-          h(PanelHeading, { title: "Manage Users" }),
-          h("form", { method: "post", action: "/admin" },
-            h("input", { type: "hidden", name: "action", value: "update_role" }),
-            h("label", null, "User"),
-            h("select", { name: "user_id" },
-              users.map((user) => h("option", { value: user.id, key: user.id }, `${user.username} (${user.role})`))
-            ),
-            h("label", null, "KYC Status"),
-            h("select", { name: "kyc_status", defaultValue: "pending" },
-              h("option", { value: "pending" }, "Pending"),
-              h("option", { value: "verified" }, "Verified"),
-              h("option", { value: "rejected" }, "Rejected")
-            ),
-            h("button", { type: "submit" }, "Update User")
-          )
-        ),
-        h("div", { className: "card action-card" },
-          h(PanelHeading, { title: "Watchlist Entry" }),
-          h("form", { method: "post", action: "/admin" },
-            h("input", { type: "hidden", name: "action", value: "add_watchlist" }),
-            h("label", null, "Name"),
-            h("input", { name: "wl_name", required: true }),
-            h("label", null, "ID Number"),
-            h("input", { name: "wl_id_number" }),
-            h("label", null, "List Type"),
-            h("select", { name: "wl_type", defaultValue: "internal" },
-              h("option", { value: "internal" }, "Internal"),
-              h("option", { value: "pep" }, "PEP"),
-              h("option", { value: "sanctions" }, "Sanctions")
-            ),
-            h("label", null, "Reason"),
-            h("input", { name: "wl_reason" }),
-            h("button", { type: "submit" }, "Add to Watchlist")
-          )
+    const renderSection = () => {
+      switch (activeSection) {
+        case "overview":
+          return h(window.React.Fragment, null,
+            h(StatGrid, { items: metricItems }),
+            h("section", { className: "react-dashboard-grid" },
+              h("div", { className: "card action-card" },
+                h(PanelHeading, { title: "Transaction Simulator", meta: h("span", { className: "status-pill" }, "Customers only") }),
+                h("p", { className: "muted-line" }, "Generate realistic deposits, withdrawals, and transfers using registered customer accounts."),
+                h("form", { method: "post", action: "/admin/generate-transactions" },
+                  h("label", null, "Number of Transactions"),
+                  h("select", { name: "count", defaultValue: "100" },
+                    h("option", { value: "100" }, "100"),
+                    h("option", { value: "500" }, "500"),
+                    h("option", { value: "1000" }, "1000"),
+                    h("option", { value: "2000" }, "2000")
+                  ),
+                  h("button", { type: "submit" }, "Generate Transactions")
+                )
+              ),
+              h("div", { className: "card action-card" },
+                h(PanelHeading, { title: "Manage Users" }),
+                h("form", { method: "post", action: "/admin" },
+                  h("input", { type: "hidden", name: "action", value: "update_role" }),
+                  h("label", null, "User"),
+                  h("select", { name: "user_id" },
+                    users.map((user) => h("option", { value: user.id, key: user.id }, `${user.username} (${user.role})`))
+                  ),
+                  h("label", null, "KYC Status"),
+                  h("select", { name: "kyc_status", defaultValue: "pending" },
+                    h("option", { value: "pending" }, "Pending"),
+                    h("option", { value: "verified" }, "Verified"),
+                    h("option", { value: "rejected" }, "Rejected")
+                  ),
+                  h("button", { type: "submit" }, "Update User")
+                )
+              ),
+              h("div", { className: "card action-card" },
+                h(PanelHeading, { title: "Watchlist Entry" }),
+                h("form", { method: "post", action: "/admin" },
+                  h("input", { type: "hidden", name: "action", value: "add_watchlist" }),
+                  h("label", null, "Name"),
+                  h("input", { name: "wl_name", required: true }),
+                  h("label", null, "ID Number"),
+                  h("input", { name: "wl_id_number" }),
+                  h("label", null, "List Type"),
+                  h("select", { name: "wl_type", defaultValue: "internal" },
+                    h("option", { value: "internal" }, "Internal"),
+                    h("option", { value: "pep" }, "PEP"),
+                    h("option", { value: "sanctions" }, "Sanctions")
+                  ),
+                  h("label", null, "Reason"),
+                  h("input", { name: "wl_reason" }),
+                  h("button", { type: "submit" }, "Add to Watchlist")
+                )
+              )
+            )
+          );
+        case "users":
+          return h(UsersTable, { users });
+        case "transactions":
+          return h(AdminTransactionsPanel, { transactions });
+        case "watchlist":
+          return h(WatchlistPanel, { watchlist });
+        case "activity":
+          return h(ActivityPanel, { activity });
+        case "settings":
+          return h("section", { className: "admin-danger-zone" },
+            h("div", { className: "card action-card" },
+              h(PanelHeading, { title: "System Maintenance" }),
+              h("form", {
+                method: "post",
+                action: "/admin/clear-transactions",
+                onSubmit: (event) => {
+                  if (!window.confirm("Clear all transactions, alerts, reports, recent activity, and the AI model?")) {
+                    event.preventDefault();
+                  }
+                },
+              },
+                h("button", { type: "submit", className: "danger-button" }, "Clear All Transactions")
+              ),
+              h("form", {
+                method: "post",
+                action: "/admin/clear-watchlist",
+                onSubmit: (event) => {
+                  if (!window.confirm("Clear all watchlist entries?")) {
+                    event.preventDefault();
+                  }
+                },
+              },
+                h("button", { type: "submit", className: "danger-button" }, "Clear Watchlist")
+              ),
+              h("form", {
+                method: "post",
+                action: "/admin/migrate-database",
+                onSubmit: (event) => {
+                  if (!window.confirm("Run database migration to add missing columns?")) {
+                    event.preventDefault();
+                  }
+                },
+              },
+                h("button", { type: "submit", className: "danger-button" }, "Migrate Database")
+              )
+            )
+          );
+        default:
+          return null;
+      }
+    };
+
+    return h("div", { className: "admin-layout" },
+      h("button", {
+        className: "sidebar-toggle",
+        onClick: () => setSidebarOpen(true),
+        type: "button",
+        "aria-label": "Open sidebar"
+      }, h("svg", { viewBox: "0 0 24 24" },
+        h("line", { x1: "3", y1: "12", x2: "21", y2: "12" }),
+        h("line", { x1: "3", y1: "6", x2: "21", y2: "6" }),
+        h("line", { x1: "3", y1: "18", x2: "21", y2: "18" })
+      )),
+      sidebarOpen && h("div", {
+        className: "sidebar-overlay active",
+        onClick: () => setSidebarOpen(false)
+      }),
+      h("aside", { className: `admin-sidebar ${sidebarOpen ? "open" : ""}` },
+        h("h3", null, "Admin Panel"),
+        h("nav", null,
+          sidebarItems.map((item) => item.href ? 
+            h("a", {
+              key: item.id,
+              href: item.href,
+              className: "sidebar-item"
+            }, item.label) :
+            h("button", {
+              key: item.id,
+              className: activeSection === item.id ? "sidebar-item active" : "sidebar-item",
+              onClick: () => {
+                setActiveSection(item.id);
+                setSidebarOpen(false);
+              },
+              type: "button"
+            }, item.label))
         )
       ),
-      h("section", { className: "react-dashboard-grid" },
-        h(ActivityPanel, { activity }),
-        h(AdminTransactionsPanel, { transactions }),
-        h(WatchlistPanel, { watchlist })
-      ),
-      h(UsersTable, { users }),
-      h("section", { className: "admin-danger-zone" },
-        h("form", {
-          method: "post",
-          action: "/admin/clear-transactions",
-          onSubmit: (event) => {
-            if (!window.confirm("Clear all transactions, alerts, reports, recent activity, and the AI model?")) {
-              event.preventDefault();
-            }
-          },
-        },
-          h("button", { type: "submit", className: "danger-button" }, "Clear All Transactions")
-        ),
-        h("form", {
-          method: "post",
-          action: "/admin/clear-watchlist",
-          onSubmit: (event) => {
-            if (!window.confirm("Clear all watchlist entries?")) {
-              event.preventDefault();
-            }
-          },
-        },
-          h("button", { type: "submit", className: "danger-button" }, "Clear Watchlist")
-        ),
-        h("form", {
-          method: "post",
-          action: "/admin/migrate-database",
-          onSubmit: (event) => {
-            if (!window.confirm("Run database migration to add missing columns?")) {
-              event.preventDefault();
-            }
-          },
-        },
-          h("button", { type: "submit", className: "danger-button" }, "Migrate Database")
-        )
-      )
+      h("main", { className: "admin-content" }, renderSection())
     );
   }
 
@@ -535,7 +703,17 @@
     const [stats, setStats] = useState(initialData.stats || {});
     const [feed, setFeed] = useState([]);
     const [status, setStatus] = useState("Connected | live alert monitoring active");
+    const [activeSection, setActiveSection] = useState("overview");
+    const [sidebarOpen, setSidebarOpen] = useState(false);
     const filterValue = initialData.filter_value || "all";
+
+    const sidebarItems = [
+      { id: "overview", label: "Overview" },
+      { id: "alerts", label: "Alerts" },
+      { id: "activity", label: "Activity Feed" },
+      { id: "reports", label: "Reports", href: "/reports" },
+      { id: "signout", label: "Sign Out", href: "/logout" }
+    ];
 
     const addFeed = (text) => setFeed((current) => trim([{ text, timestamp: new Date().toLocaleTimeString() }, ...current], 30));
     const passesFilter = (txn) => {
@@ -590,35 +768,66 @@
       { label: "Pending CTRs", value: stats.pending_ctrs || 0, caption: "currency reports" },
     ];
 
-    return h(window.React.Fragment, null,
-      h(StatGrid, { items: metricItems }),
-      h("section", { className: "card react-filter-card action-card" },
-        h("form", { method: "get" },
-          h("label", null, "Show"),
-          h("select", { name: "filter", defaultValue: filterValue },
-            h("option", { value: "all" }, "All"),
-            h("option", { value: "flagged" }, "Flagged"),
-            h("option", { value: "suspicious" }, "Suspicious"),
-            h("option", { value: "ctr" }, "CTR required"),
-            h("option", { value: "sar" }, "SAR required")
-          ),
-          h("button", { type: "submit" }, "Apply Filter")
-        ),
-        h("p", { className: "muted-line" }, `Page ${initialData.page || 1} of ${pageCount} | ${initialData.total_count || 0} matching transactions`)
+    const renderSection = () => {
+      switch (activeSection) {
+        case "overview":
+          return h(window.React.Fragment, null,
+            h(StatGrid, { items: metricItems }),
+            h(AlertsPanel, { alerts })
+          );
+        case "alerts":
+          return h(AlertsPanel, { alerts });
+        case "activity":
+          return h("section", { className: "card table-card" },
+            h(PanelHeading, { title: "Live Compliance Feed", meta: h(LiveStatus, null, status) }),
+            feed.length ? h("ul", null, feed.map((event, index) => (
+              h("li", { className: "activity-item", key: `${event.timestamp}-${index}` },
+                h("strong", null, event.timestamp),
+                h("p", null, event.text)
+              )
+            ))) : h(EmptyState, null, "Waiting for live events.")
+          );
+        default:
+          return null;
+      }
+    };
+
+    return h("div", { className: "admin-layout" },
+      h("button", {
+        className: "sidebar-toggle",
+        onClick: () => setSidebarOpen(true),
+        type: "button",
+        "aria-label": "Open sidebar"
+      }, h("svg", { viewBox: "0 0 24 24" },
+        h("line", { x1: "3", y1: "12", x2: "21", y2: "12" }),
+        h("line", { x1: "3", y1: "6", x2: "21", y2: "6" }),
+        h("line", { x1: "3", y1: "18", x2: "21", y2: "18" })
+      )),
+      sidebarOpen && h("div", {
+        className: "sidebar-overlay active",
+        onClick: () => setSidebarOpen(false)
+      }),
+      h("aside", { className: `admin-sidebar ${sidebarOpen ? "open" : ""}` },
+        h("h3", null, "Compliance Panel"),
+        h("nav", null,
+          sidebarItems.map((item) => item.href ? 
+            h("a", {
+              key: item.id,
+              href: item.href,
+              className: "sidebar-item"
+            }, item.label) :
+            h("button", {
+              key: item.id,
+              className: activeSection === item.id ? "sidebar-item active" : "sidebar-item",
+              onClick: () => {
+                setActiveSection(item.id);
+                setSidebarOpen(false);
+              },
+              type: "button"
+            }, item.label))
+        )
       ),
-      h("section", { className: "react-dashboard-grid compliance-dashboard-grid" },
-        h(ComplianceTransactionsPanel, { transactions }),
-        h(AlertsPanel, { alerts })
-      ),
-      h("section", { className: "card table-card" },
-        h(PanelHeading, { title: "Live Compliance Feed", meta: h(LiveStatus, null, status) }),
-        feed.length ? h("ul", null, feed.map((event, index) => (
-          h("li", { className: "activity-item", key: `${event.timestamp}-${index}` },
-            h("strong", null, event.timestamp),
-            h("p", null, event.text)
-          )
-        ))) : h(EmptyState, null, "Waiting for live events.")
-      )
+      h("main", { className: "admin-content" }, renderSection())
     );
   }
 
@@ -627,7 +836,7 @@
       h(PanelHeading, { title: "Transactions" }),
       transactions.length ? h("table", { className: "data-table" },
         h("thead", null,
-          h("tr", null, ["Transaction", "Type", "Amount", "Risk", "AI Assessment"].map((head) => h("th", { key: head }, head)))
+          h("tr", null, ["Transaction", "Type", "Amount", "AI Assessment"].map((head) => h("th", { key: head }, head)))
         ),
         h("tbody", null,
           transactions.map((txn, index) => h("tr", { key: txn.id || index },
@@ -638,12 +847,8 @@
             h("td", null, labelize(txn.transaction_type || txn.type)),
             h("td", null, money(txn.amount)),
             h("td", null,
-              h("span", { className: riskClass(txn.risk_level) }, labelize(txn.risk_level)),
+              h("span", { className: riskClass(txn.ai_risk_level || txn.risk_level) }, labelize(txn.ai_risk_level || txn.risk_level || "unavailable")),
               h("span", { className: "muted-line block-line" }, `Score ${score(txn.risk_score)}`)
-            ),
-            h("td", null,
-              h("span", null, `${labelize(txn.ai_risk_level || "unavailable")}`),
-              h("span", { className: "muted-line block-line" }, `${confidence(txn.ai_confidence)}`)
             )
           ))
         )

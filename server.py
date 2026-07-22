@@ -1,8 +1,8 @@
 """
 
-app.py — StanPro Bank AML Intelligence Platform
+server.py — StanPro Bank AML Intelligence Platform (Consolidated Web Server)
 
-==========================================
+=========================================================================
 
 Industry-ready Flask application aligned with:
 
@@ -13,8 +13,6 @@ Industry-ready Flask application aligned with:
   • FinCEN / FIU reporting workflows
 
   • Zimbabwe FIU Act reporting obligations
-
-
 
 New capabilities vs prototype:
 
@@ -36,11 +34,11 @@ New capabilities vs prototype:
 
   • API endpoints for external SIEM / BI integration
 
+  • Real-time event broadcasting via WebSocket/Redis/Kafka
+
 """
 
 
-
-import ai_detector
 
 import json
 
@@ -164,15 +162,11 @@ class RealtimeBroker:
                 self._redis_client = redis.from_url(
                     redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=5.0,
-                    socket_timeout=5.0,
+                    socket_connect_timeout=0.5,
+                    socket_timeout=0.5,
                 )
                 self._redis_client.ping()
-                if self.app:
-                    self.app.logger.info(f"RealtimeBroker connected to Redis: {redis_url}")
-            except Exception as e:
-                if self.app:
-                    self.app.logger.error(f"RealtimeBroker failed to connect to Redis: {e}")
+            except Exception:
                 self._redis_client = None
 
         kafka_bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS")
@@ -245,9 +239,9 @@ class RealtimeBroker:
                 pass
         if self.socketio is not None:
             try:
-                self.socketio.emit(event_name, payload)
+                self.socketio.emit(event_name, payload, broadcast=True)
                 if self.app:
-                    self.app.logger.info(f"SocketIO broadcast event: {event_name}")
+                    self.app.logger.info(f"SocketIO broadcast event: {event_name} (broadcast=True)")
             except Exception as e:
                 if self.app:
                     self.app.logger.error(f"SocketIO broadcast failed for {event_name}: {e}")
@@ -348,6 +342,8 @@ class RealtimeBroker:
 
 
 
+
+
 load_dotenv()
 
 
@@ -443,6 +439,11 @@ def assess_transaction_behavioral_risk(
     """
     Assess transaction risk using behavioral profiling.
     
+    Engineering Constraint: No Circular Flagging
+    - Behavioral scoring is based strictly on statistical anomalies (velocity, amount deviation, counterparty network)
+    - Past alerts, alert counts, or historical risk ratings are NOT used in scoring
+    - Cold-start grace period: Users with < 5 transactions get neutral baseline, rely on global ML model
+    
     Returns:
         (risk_score, risk_level, reason, anomaly_reasons)
     """
@@ -454,10 +455,16 @@ def assess_transaction_behavioral_risk(
         profile = build_or_update_customer_profile(conn, sender_account)
     
     if not profile:
-        # Insufficient data for behavioral analysis
-        return 0, "normal", "Insufficient transaction history for behavioral analysis", []
+        # Insufficient data for behavioral analysis - cold start
+        # Return neutral baseline to rely on global ML model (ai_core.py)
+        return 0, "normal", "Cold-start: insufficient transaction history for behavioral analysis (< 5 transactions)", []
     
-    # Detect anomaly
+    # Cold-start grace period: check if user has < 5 transactions
+    if profile.total_transactions < 5:
+        # Return neutral baseline to rely on global ML model
+        return 0, "normal", f"Cold-start: building behavioral baseline ({profile.total_transactions}/5 transactions)", []
+    
+    # Detect anomaly using statistical features only (velocity, amount deviation, counterparty network)
     anomaly = behavioral_profiler.detect_anomaly(profile, transaction)
     
     # Update profile with this transaction (pass anomaly score for adaptive learning)
@@ -1183,6 +1190,10 @@ def init_db():
 
         _migrate_mysql(conn)
 
+    elif is_postgres_database_url(app.config["DATABASE"]):
+
+        _migrate_postgres(conn)
+
     conn.commit()
 
     conn.close()
@@ -1238,7 +1249,6 @@ def _migrate_sqlite(conn):
 
 
 def _migrate_mysql(conn):
-
     """Widen older MySQL VARCHAR columns that store AML evidence JSON/text."""
 
     column_migrations = {
@@ -1250,19 +1260,29 @@ def _migrate_mysql(conn):
             ("wealth_segment", "VARCHAR(255) DEFAULT 'average'"),
         ],
         "transactions": [
-
+            ("currency", "VARCHAR(255) DEFAULT 'USD'"),
+            ("channel", "VARCHAR(255) DEFAULT 'online'"),
             ("rule_score", "DOUBLE DEFAULT 0"),
-
             ("rule_level", "VARCHAR(255) DEFAULT 'normal'"),
-
             ("rule_reason", "LONGTEXT"),
-
             ("ai_risk_level", "VARCHAR(255)"),
-
             ("ai_confidence", "DOUBLE DEFAULT 0"),
-
             ("ai_reason", "LONGTEXT"),
-
+            ("rules_triggered", "LONGTEXT DEFAULT '[]'"),
+            ("ctr_required", "INTEGER DEFAULT 0"),
+            ("sar_required", "INTEGER DEFAULT 0"),
+            ("destination_country", "VARCHAR(255) DEFAULT 'ZW'"),
+            ("screening_hits", "LONGTEXT"),
+            ("reviewed_by", "VARCHAR(255)"),
+            ("reviewed_at", "VARCHAR(255)"),
+        ],
+        "alerts": [
+            ("rules_triggered", "LONGTEXT DEFAULT '[]'"),
+            ("status", "VARCHAR(255) DEFAULT 'open'"),
+            ("assigned_to", "VARCHAR(255)"),
+            ("case_notes", "LONGTEXT"),
+            ("resolved_at", "VARCHAR(255)"),
+            ("resolved_by", "VARCHAR(255)"),
         ],
         "behavioral_profiles": [
             ("account_number", "VARCHAR(255) PRIMARY KEY"),
@@ -1270,54 +1290,96 @@ def _migrate_mysql(conn):
             ("last_updated", "VARCHAR(255)"),
             ("total_transactions", "INTEGER DEFAULT 0"),
         ],
-
     }
 
     for table, columns in column_migrations.items():
-
-        existing = {
-
-            row["Field"]
-
-            for row in conn.execute(f"SHOW COLUMNS FROM {table}").fetchall()
-
-        }
-
-        for column_name, column_def in columns:
-
-            if column_name not in existing:
-
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}")
+        try:
+            existing = {
+                row["Field"]
+                for row in conn.execute(f"SHOW COLUMNS FROM {table}").fetchall()
+            }
+            for column_name, column_def in columns:
+                if column_name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}")
+        except Exception as e:
+            logging.error(f"Error adding columns to {table}: {e}")
 
 
+def _migrate_postgres(conn):
+    """Add columns for PostgreSQL databases."""
+    column_migrations = {
+        "users": [
+            ("kyc_status", "TEXT DEFAULT 'pending'"),
+            ("pep_flag", "INTEGER DEFAULT 0"),
+            ("risk_rating", "TEXT DEFAULT 'standard'"),
+            ("wealth_segment", "TEXT DEFAULT 'average'"),
+        ],
+        "transactions": [
+            ("currency", "TEXT DEFAULT 'USD'"),
+            ("channel", "TEXT DEFAULT 'online'"),
+            ("rule_score", "DOUBLE PRECISION DEFAULT 0"),
+            ("rule_level", "TEXT DEFAULT 'normal'"),
+            ("rule_reason", "TEXT"),
+            ("ai_risk_level", "TEXT"),
+            ("ai_confidence", "DOUBLE PRECISION DEFAULT 0"),
+            ("ai_reason", "TEXT"),
+            ("rules_triggered", "TEXT DEFAULT '[]'"),
+            ("ctr_required", "INTEGER DEFAULT 0"),
+            ("sar_required", "INTEGER DEFAULT 0"),
+            ("destination_country", "TEXT DEFAULT 'ZW'"),
+            ("screening_hits", "TEXT"),
+            ("reviewed_by", "TEXT"),
+            ("reviewed_at", "TEXT"),
+        ],
+        "alerts": [
+            ("rules_triggered", "TEXT DEFAULT '[]'"),
+            ("status", "TEXT DEFAULT 'open'"),
+            ("assigned_to", "TEXT"),
+            ("case_notes", "TEXT"),
+            ("resolved_at", "TEXT"),
+            ("resolved_by", "TEXT"),
+        ],
+        "behavioral_profiles": [
+            ("account_number", "TEXT PRIMARY KEY"),
+            ("profile_data", "TEXT"),
+            ("last_updated", "TEXT"),
+            ("total_transactions", "INTEGER DEFAULT 0"),
+        ],
+    }
 
-    migrations = [
-
-        "ALTER TABLE transactions MODIFY COLUMN description LONGTEXT",
-
-        "ALTER TABLE transactions MODIFY COLUMN rules_triggered LONGTEXT",
-
-        "ALTER TABLE transactions MODIFY COLUMN rule_reason LONGTEXT",
-
-        "ALTER TABLE transactions MODIFY COLUMN ai_reason LONGTEXT",
-
-        "ALTER TABLE alerts MODIFY COLUMN reason LONGTEXT NOT NULL",
-
-        "ALTER TABLE alerts MODIFY COLUMN rules_triggered LONGTEXT",
-
-        "ALTER TABLE alerts MODIFY COLUMN case_notes LONGTEXT",
-
-        "ALTER TABLE sar_reports MODIFY COLUMN narrative LONGTEXT NOT NULL",
-
-        "ALTER TABLE watchlist MODIFY COLUMN reason LONGTEXT",
-
-        "ALTER TABLE activity_log MODIFY COLUMN detail LONGTEXT NOT NULL",
-
-    ]
-
-    for statement in migrations:
-
-        conn.execute(statement)
+    for table, columns in column_migrations.items():
+        try:
+            # Check if table exists
+            table_exists = conn.execute(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
+                (table,)
+            ).fetchone()[0]
+            
+            if not table_exists:
+                # Create behavioral_profiles table if it doesn't exist
+                if table == "behavioral_profiles":
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS behavioral_profiles (
+                            account_number TEXT PRIMARY KEY,
+                            profile_data TEXT,
+                            last_updated TEXT,
+                            total_transactions INTEGER DEFAULT 0
+                        )
+                    """)
+                continue
+                
+            existing = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                    (table,)
+                ).fetchall()
+            }
+            for column_name, column_def in columns:
+                if column_name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}")
+        except Exception as e:
+            logging.error(f"Error adding columns to {table}: {e}")
 
 
 
@@ -1605,8 +1667,7 @@ def get_last_insert_id(conn):
 
 
 def broadcast_event(event_name, payload):
-    if app:
-        app.logger.info(f"broadcast_event called: {event_name}")
+
     app.extensions["realtime_broker"].publish(event_name, payload)
 
 
@@ -1663,7 +1724,7 @@ def request_page(default=1):
 
     try:
 
-        page = int(request.args.get("page", default))
+        page = int(request.args.get("page", 1))
 
     except (TypeError, ValueError):
 
@@ -1853,9 +1914,9 @@ def _random_transaction_amount(tx_type):
 
 def _simulation_plan(count):
 
-    normal_count = int(count * 0.80)
+    normal_count = int(count * 0.60)
 
-    suspicious_count = int(count * 0.15)
+    suspicious_count = int(count * 0.30)
 
     super_count = count - normal_count - suspicious_count
 
@@ -2352,7 +2413,7 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
         LEFT JOIN users u ON t.sender_account = u.account_number
 
-        WHERE sender_account=? AND id<>? AND timestamp<?
+        WHERE sender_account=? AND t.id<>? AND timestamp<?
 
         """,
 
@@ -2366,9 +2427,9 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
         SELECT COUNT(*) AS tx_count, COALESCE(SUM(amount), 0) AS volume
 
-        FROM transactions
+        FROM transactions t
 
-        WHERE sender_account=? AND id<>? AND timestamp>=? AND timestamp<?
+        WHERE sender_account=? AND t.id<>? AND timestamp>=? AND timestamp<?
 
         """,
 
@@ -2380,9 +2441,9 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
         """
 
-        SELECT id FROM transactions
+        SELECT id FROM transactions t
 
-        WHERE sender_account=? AND receiver_account=? AND id<>? AND timestamp<?
+        WHERE sender_account=? AND receiver_account=? AND t.id<>? AND timestamp<?
 
         LIMIT 1
 
@@ -2394,13 +2455,13 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
 
 
-    avg_amount = float(prior["avg_amount"] if prior else 0)
+    avg_amount = float(prior.get("avg_amount") if prior else 0)
 
-    max_amount = float(prior["max_amount"] if prior else 0)
+    max_amount = float(prior.get("max_amount") if prior else 0)
 
-    tx_count = int(prior["tx_count"] if prior else 0)
+    tx_count = int(prior.get("tx_count") if prior else 0)
 
-    volume_24h = float(recent["volume"] if recent else 0)
+    volume_24h = float(recent.get("volume") if recent else 0)
 
     amount = float(amount)
 
@@ -2420,7 +2481,7 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
         "amount_to_sender_max": amount / max_amount if max_amount > 0 else 1.0,
 
-        "sender_tx_count_24h": int(recent["tx_count"] if recent else 0),
+        "sender_tx_count_24h": int(recent.get("tx_count") if recent else 0),
 
         "sender_volume_24h": volume_24h,
 
@@ -2428,7 +2489,7 @@ def _ai_profile_for_transaction(conn, transaction_id, sender_account, receiver_a
 
         "is_new_recipient": 0.0 if recipient_seen else 1.0,
 
-        "wealth_segment": prior["wealth_segment"] if prior and prior["wealth_segment"] else "average",
+        "wealth_segment": prior.get("wealth_segment") if prior and prior.get("wealth_segment") else "average",
 
     })
 
@@ -2660,7 +2721,7 @@ def _combine_rule_ai_risk(rule_score, rule_level, rule_reason, triggered_rules, 
 
 
 
-            if ai_level == "normal" and ai_confidence >= 0.75 and rule_rank < RISK_RANK["suspicious"]:
+            if ai_level == "normal" and ai_confidence >= 0.85 and rule_rank < RISK_RANK["low"]:
 
                 final_score = min(blended_score, 24)
 
@@ -3169,7 +3230,7 @@ def login_required(*roles):
 
                 return redirect(url_for("login"))
 
-            if roles and user["role"] not in roles:
+            if roles and user and user.get("role") not in roles:
 
                 flash("Access denied.")
 
@@ -3406,7 +3467,7 @@ def register():
 
             user_count = get_db().execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
 
-            acct = f"ACC{1000 + int(user_count) + 1}"
+            acct = f"ACC{1000 + int(user_count or 0) + 1}"
 
             pep_flag = 1 if any(h.list_type == "pep" for h in reg_hits) else 0
 
@@ -3802,7 +3863,7 @@ def create_transaction():
 
         recipient_user = get_user_by_account_number(recipient_account)
 
-        if not recipient_user or recipient_user["id"] == user["id"] or recipient_user["role"] != "customer":
+        if not recipient_user or (recipient_user.get("id") is not None and recipient_user.get("id") == user["id"]) or (recipient_user.get("role") is not None and recipient_user.get("role") != "customer"):
 
             flash("Recipient customer account not found.")
 
@@ -3814,7 +3875,7 @@ def create_transaction():
 
     sender_account = user["account_number"]
 
-    receiver_account = recipient_user["account_number"] if recipient_user else user["account_number"]
+    receiver_account = recipient_user.get("account_number") if recipient_user and recipient_user.get("account_number") else user["account_number"]
 
 
 
@@ -3862,7 +3923,8 @@ def create_transaction():
 
         get_db().execute("UPDATE users SET balance=balance-? WHERE id=?", (amount, user["id"]))
 
-        get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, recipient_user["id"]))
+        if recipient_user and recipient_user.get("id") is not None:
+            get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, recipient_user["id"]))
 
 
 
@@ -3922,27 +3984,15 @@ def compliance_dashboard():
 
     offset = (page - 1) * PAGE_SIZE
 
-
-
-    if filter_value == "flagged":
-
-        base = "WHERE risk_level!='normal'"
-
-    elif filter_value == "suspicious":
-
-        base = "WHERE risk_level IN ('suspicious','super_suspicious','high_risk','critical')"
-
-    elif filter_value == "ctr":
-
-        base = "WHERE ctr_required=1"
-
-    elif filter_value == "sar":
-
-        base = "WHERE sar_required=1"
-
-    else:
-
-        base = ""
+    # Whitelist of valid filter values to prevent SQL injection
+    VALID_FILTERS = {
+        "all": "",
+        "flagged": "WHERE risk_level!='normal'",
+        "suspicious": "WHERE risk_level IN ('suspicious','super_suspicious','high_risk','critical')",
+        "ctr": "WHERE ctr_required=1",
+        "sar": "WHERE sar_required=1",
+    }
+    base = VALID_FILTERS.get(filter_value, "")
 
 
 
@@ -4095,14 +4145,14 @@ def alert_detail(alert_id):
             )
 
             # Update customer risk rating
-
-            old_risk = account_user.get("risk_rating", "standard") if account_user else "standard"
-
-            new_risk = update_customer_risk_rating(get_db(), alert["account_number"], "resolve", old_risk)
-
-            record_activity(officer["username"], "resolve_alert", f"Alert #{alert_id} resolved, risk rating: {old_risk} -> {new_risk}")
-
-            flash(f"Alert #{alert_id} marked as resolved. Customer risk rating updated to {new_risk}.")
+            if account_user:
+                old_risk = account_user.get("risk_rating", "standard")
+                new_risk = update_customer_risk_rating(get_db(), alert.get("account_number"), "resolve", old_risk)
+                record_activity(officer["username"], "resolve_alert", f"Alert #{alert_id} resolved, risk rating: {old_risk} -> {new_risk}")
+                flash(f"Alert #{alert_id} marked as resolved. Customer risk rating updated to {new_risk}.")
+            else:
+                record_activity(officer["username"], "resolve_alert", f"Alert #{alert_id} resolved (account not found)")
+                flash(f"Alert #{alert_id} marked as resolved.")
 
 
 
@@ -4117,14 +4167,14 @@ def alert_detail(alert_id):
             )
 
             # Update customer risk rating
-
-            old_risk = account_user.get("risk_rating", "standard") if account_user else "standard"
-
-            new_risk = update_customer_risk_rating(get_db(), alert["account_number"], "escalate", old_risk)
-
-            record_activity(officer["username"], "escalate_alert", f"Alert #{alert_id} escalated, risk rating: {old_risk} -> {new_risk}")
-
-            flash(f"Alert #{alert_id} escalated. Customer risk rating updated to {new_risk}.")
+            if account_user:
+                old_risk = account_user.get("risk_rating", "standard")
+                new_risk = update_customer_risk_rating(get_db(), alert.get("account_number"), "escalate", old_risk)
+                record_activity(officer["username"], "escalate_alert", f"Alert #{alert_id} escalated, risk rating: {old_risk} -> {new_risk}")
+                flash(f"Alert #{alert_id} escalated. Customer risk rating updated to {new_risk}.")
+            else:
+                record_activity(officer["username"], "escalate_alert", f"Alert #{alert_id} escalated (account not found)")
+                flash(f"Alert #{alert_id} escalated.")
 
 
 
@@ -4138,7 +4188,7 @@ def alert_detail(alert_id):
 
                 "INSERT INTO sar_reports (alert_id, account_number, filed_by, narrative, status, reference_number, created_at) VALUES (?,?,?,?,'draft',?,?)",
 
-                (alert_id, alert["account_number"], officer["username"], narrative, ref,
+                (alert_id, alert.get("account_number"), officer["username"], narrative, ref,
 
                  datetime.now(timezone.utc).isoformat()),
 
@@ -4153,14 +4203,14 @@ def alert_detail(alert_id):
             )
 
             # Update customer risk rating
-
-            old_risk = account_user.get("risk_rating", "standard") if account_user else "standard"
-
-            new_risk = update_customer_risk_rating(get_db(), alert["account_number"], "file_sar", old_risk)
-
-            record_activity(officer["username"], "file_sar", f"SAR {ref} filed for alert #{alert_id}, risk rating: {old_risk} -> {new_risk}")
-
-            flash(f"SAR filed successfully. Reference: {ref}. Customer risk rating updated to {new_risk}.")
+            if account_user:
+                old_risk = account_user.get("risk_rating", "standard")
+                new_risk = update_customer_risk_rating(get_db(), alert["account_number"], "file_sar", old_risk)
+                record_activity(officer["username"], "file_sar", f"SAR {ref} filed for alert #{alert_id}, risk rating: {old_risk} -> {new_risk}")
+                flash(f"SAR filed successfully. Reference: {ref}. Customer risk rating updated to {new_risk}.")
+            else:
+                record_activity(officer["username"], "file_sar", f"SAR {ref} filed for alert #{alert_id} (account not found)")
+                flash(f"SAR filed successfully. Reference: {ref}.")
 
 
 
@@ -4446,185 +4496,183 @@ def generate_transactions():
 
         count = 100
 
+    try:
 
+        users = get_db().execute(
 
-    users = get_db().execute(
+            "SELECT id, username, account_number, balance, wealth_segment FROM users WHERE role='customer' ORDER BY id"
 
-        "SELECT id, username, account_number, balance, wealth_segment FROM users WHERE role='customer' ORDER BY id"
+        ).fetchall()
 
-    ).fetchall()
+        if not users:
 
-    if not users:
+            flash("No customer accounts are available for transaction generation.")
 
-        flash("No customer accounts are available for transaction generation.")
-
-        return redirect(url_for("admin_dashboard"))
-
-
-
-    generated = {"normal": 0, "flagged": 0, "critical": 0}
-
-    for label in _simulation_plan(count):
-
-        (
-
-            sender, recipient, tx_type, amount, timestamp,
-
-            channel, description, _scenario_reason, dest_country,
-
-        ) = _simulation_transaction(label, users)
-
-        sender_account = sender["account_number"]
-
-        receiver_account = recipient["account_number"] if tx_type == "transfer" else sender_account
+            return redirect(url_for("admin_dashboard"))
 
 
 
-        get_db().execute(
+        generated = {"normal": 0, "flagged": 0, "critical": 0}
 
-            """
-
-            INSERT INTO transactions (sender_account, receiver_account, amount, transaction_type,
-
-                currency, channel, timestamp, status, risk_score, risk_level, description,
-
-                destination_country)
-
-            VALUES (?,?,?,?,?,?,?,'Completed',0,'normal',?,?)
-
-            """,
+        # Batch insert transactions first for performance
+        transactions_to_process = []
+        for label in _simulation_plan(count):
 
             (
 
-                sender_account, receiver_account, amount, tx_type, "USD", channel, timestamp,
+                sender, recipient, tx_type, amount, timestamp,
 
-                description, dest_country,
+                channel, description, _scenario_reason, dest_country,
+
+            ) = _simulation_transaction(label, users)
+
+            sender_account = sender["account_number"]
+
+            receiver_account = recipient["account_number"] if tx_type == "transfer" else sender_account
+
+            get_db().execute(
+
+                """
+
+                INSERT INTO transactions (sender_account, receiver_account, amount, transaction_type,
+
+                    currency, channel, timestamp, status, risk_score, risk_level, description,
+
+                    destination_country)
+
+                VALUES (?,?,?,?,?,?,?,'Completed',0,'normal',?,?)
+
+                """,
+
+                (
+
+                    sender_account, receiver_account, amount, tx_type, "USD", channel, timestamp,
+
+                    description, dest_country,
+
+                ),
+
+            )
+
+            transaction_id = get_last_insert_id(get_db())
+
+            transactions_to_process.append((transaction_id, sender, recipient, tx_type, amount, timestamp, sender_account, receiver_account, dest_country))
+
+            # Update balances immediately
+            if tx_type == "deposit":
+
+                get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, sender["id"]))
+
+            elif tx_type == "withdraw":
+
+                get_db().execute(
+
+                    "UPDATE users SET balance=CASE WHEN balance > ? THEN balance-? ELSE 0 END WHERE id=?",
+
+                    (amount, amount, sender["id"]),
+
+                )
+
+            elif tx_type == "transfer":
+
+                get_db().execute(
+
+                    "UPDATE users SET balance=CASE WHEN balance > ? THEN balance-? ELSE 0 END WHERE id=?",
+
+                    (amount, amount, sender["id"]),
+
+                )
+
+                get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, recipient["id"]))
+
+        get_db().commit()
+
+        # Process transactions in batch for AML rules and AI
+        for transaction_id, sender, recipient, tx_type, amount, timestamp, sender_account, receiver_account, dest_country in transactions_to_process:
+
+            risk_score, risk_level, reason, alert_id = process_transaction_event(
+
+                get_db(), transaction_id, sender_account, receiver_account,
+
+                amount, tx_type, timestamp, account_number=sender_account,
+
+                destination_country=dest_country,
+
+            )
+
+
+
+            if risk_level in ("normal", "low"):
+
+                generated["normal"] += 1
+
+            elif risk_level in ("critical", "high_risk"):
+
+                generated["critical"] += 1
+
+            else:
+
+                generated["flagged"] += 1
+
+        get_db().commit()
+
+        for user_row in get_db().execute(
+
+            "SELECT account_number FROM users ORDER BY id"
+
+        ).fetchall():
+
+            broadcast_user_balance(get_db(), user_row["account_number"])
+
+        broadcast_event("transaction_batch", {
+
+            "count": count,
+
+            "normal": generated["normal"],
+
+            "flagged": generated["flagged"],
+
+            "critical": generated["critical"],
+
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+
+        })
+
+        broadcast_stats(get_db())
+
+        model = _train_ai_model_from_db(get_db())
+
+        record_activity(
+
+            admin_user["username"],
+
+            "generate_transactions",
+
+            (
+
+                f"Generated {count} rule-scored transactions: "
+
+                f"{generated['normal']} normal, {generated['flagged']} flagged, "
+
+                f"{generated['critical']} critical/high-risk"
 
             ),
 
         )
 
-        transaction_id = get_last_insert_id(get_db())
+        flash(f"Generated {count} transactions: {generated['normal']} normal, {generated['flagged']} flagged, {generated['critical']} critical.")
 
+        return redirect(url_for("admin_dashboard"))
 
+    except Exception as e:
 
-        risk_score, risk_level, reason, alert_id = process_transaction_event(
+        get_db().rollback()
 
-            get_db(), transaction_id, sender_account, receiver_account,
+        app.logger.error(f"Transaction generation failed: {e}")
 
-            amount, tx_type, timestamp, account_number=sender_account,
+        flash(f"Transaction generation failed: {str(e)}")
 
-            destination_country=dest_country,
-
-        )
-
-
-
-        if risk_level in ("normal", "low"):
-
-            generated["normal"] += 1
-
-        elif risk_level in ("critical", "high_risk"):
-
-            generated["critical"] += 1
-
-        else:
-
-            generated["flagged"] += 1
-
-
-
-        if tx_type == "deposit":
-
-            get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, sender["id"]))
-
-        elif tx_type == "withdraw":
-
-            get_db().execute(
-
-                "UPDATE users SET balance=CASE WHEN balance > ? THEN balance-? ELSE 0 END WHERE id=?",
-
-                (amount, amount, sender["id"]),
-
-            )
-
-        else:
-
-            get_db().execute(
-
-                "UPDATE users SET balance=CASE WHEN balance > ? THEN balance-? ELSE 0 END WHERE id=?",
-
-                (amount, amount, sender["id"]),
-
-            )
-
-            get_db().execute("UPDATE users SET balance=balance+? WHERE id=?", (amount, recipient["id"]))
-
-
-
-    get_db().commit()
-
-    for user_row in get_db().execute(
-
-        "SELECT account_number FROM users ORDER BY id"
-
-    ).fetchall():
-
-        broadcast_user_balance(get_db(), user_row["account_number"])
-
-    broadcast_event("transaction_batch", {
-
-        "count": count,
-
-        "normal": generated["normal"],
-
-        "flagged": generated["flagged"],
-
-        "critical": generated["critical"],
-
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-
-    })
-
-    broadcast_stats(get_db())
-
-    model = _train_ai_model_from_db(get_db())
-
-    record_activity(
-
-        admin_user["username"],
-
-        "generate_transactions",
-
-        (
-
-            f"Generated {count} rule-scored transactions: "
-
-            f"{generated['normal']} normal, {generated['flagged']} flagged, "
-
-            f"{generated['critical']} critical/high-risk"
-
-        ),
-
-    )
-
-    if model is None:
-
-        flash("Transactions generated through AML rule engine; AI training needs more labelled data.")
-
-    else:
-
-        meta = get_model_metadata()
-
-        flash(
-
-            f"Generated {count} transactions via full AML pipeline (rules + AI + screening). "
-
-            f"AI model v{meta.get('version', '?')} trained on {meta.get('training_samples', '?')} samples."
-
-        )
-
-    return redirect(url_for("admin_dashboard"))
+        return redirect(url_for("admin_dashboard"))
 
 
 
@@ -4700,19 +4748,28 @@ def migrate_database():
 
     conn = get_db()
 
-    if DB_TYPE == "sqlite":
+    try:
+        if not is_postgres_database_url(app.config["DATABASE"]) and not is_mysql_database_url(app.config["DATABASE"]):
 
-        _migrate_sqlite(conn)
+            _migrate_sqlite(conn)
 
-    elif DB_TYPE == "mysql":
+        elif is_mysql_database_url(app.config["DATABASE"]):
 
-        _migrate_mysql(conn)
+            _migrate_mysql(conn)
 
-    conn.commit()
+        conn.commit()
 
-    record_activity(admin_user["username"], "migrate_database", "Ran database migration")
+        record_activity(admin_user["username"], "migrate_database", "Ran database migration")
 
-    flash("Database migration completed successfully.")
+        flash("Database migration completed successfully.")
+
+    except Exception as e:
+
+        conn.rollback()
+
+        app.logger.error(f"Database migration failed: {e}")
+
+        flash(f"Database migration failed: {str(e)}")
 
     return redirect(url_for("admin_dashboard"))
 
@@ -4764,7 +4821,7 @@ def reports():
 
         """
 
-        SELECT substr(timestamp,1,7) as month, COUNT(*) as count, SUM(amount) as volume
+        SELECT SUBSTRING(timestamp,1,7) as month, COUNT(*) as count, SUM(amount) as volume
 
         FROM transactions
 
@@ -4964,6 +5021,16 @@ def ensure_ai_model_ready():
 
 
 
+
+
+# Initialize database on startup (for gunicorn deployment)
+try:
+    init_db()
+    seed_demo_data()
+    ensure_ai_model_ready()
+    ensure_background_monitor()
+except Exception as e:
+    logging.error(f"Error during startup initialization: {e}")
 
 
 if __name__ == "__main__":
