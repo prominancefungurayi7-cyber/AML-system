@@ -1,6 +1,7 @@
 """
 
 app.py — StanPro Bank AML Intelligence Platform
+Cross-device realtime enabled with Redis message queue
 
 ==========================================
 
