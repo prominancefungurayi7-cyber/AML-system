@@ -4139,7 +4139,7 @@ def alert_detail(alert_id):
 
                 "INSERT INTO sar_reports (alert_id, account_number, filed_by, narrative, status, reference_number, created_at) VALUES (?,?,?,?,'draft',?,?)",
 
-                (alert_id, alert["account_number"], officer["username"], narrative, ref,
+                (alert_id, alert.get("account_number"), officer["username"], narrative, ref,
 
                  datetime.now(timezone.utc).isoformat()),
 
@@ -4157,7 +4157,7 @@ def alert_detail(alert_id):
 
             old_risk = account_user.get("risk_rating", "standard") if account_user else "standard"
 
-            new_risk = update_customer_risk_rating(get_db(), alert["account_number"], "file_sar", old_risk)
+            new_risk = update_customer_risk_rating(get_db(), alert.get("account_number"), "file_sar", old_risk)
 
             record_activity(officer["username"], "file_sar", f"SAR {ref} filed for alert #{alert_id}, risk rating: {old_risk} -> {new_risk}")
 
